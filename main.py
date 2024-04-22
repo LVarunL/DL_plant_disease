@@ -1,0 +1,115 @@
+import os
+from fastapi import FastAPI, File, UploadFile
+from PIL import Image
+import torchvision.transforms.functional as TF
+import CNN
+import numpy as np
+import torch
+import pandas as pd
+import uvicorn
+from typing import Optional
+from fastapi.responses import FileResponse
+from azure.storage.blob import BlobServiceClient
+
+
+app = FastAPI()
+
+disease_info = pd.read_csv('disease_info.csv', encoding='cp1252')
+supplement_info = pd.read_csv('supplement_info.csv', encoding='cp1252')
+
+account_name = 'plantdiseasemodel'
+account_key = 'thWXBWppHxNiWmQ5f31cWXaFtxJmwIedZtH6rUqkcich+ztjXvuK0YED4Pq4Ac6SHPBwZnrOvoLc+ASt8h8+Pw=='
+container_name = 'model'
+blob_name = 'plant_disease_model_1_latest.pt'
+
+# Initialize BlobServiceClient
+blob_service_client = BlobServiceClient(
+    account_url=f"https://{account_name}.blob.core.windows.net",
+    credential=account_key
+)
+
+# Get the blob client for the .pt file
+blob_client = blob_service_client.get_blob_client(container=container_name, blob=blob_name)
+
+# Download the .pt file to a local path
+local_file_path = "plant_disease_model.pt"
+with open(local_file_path, "wb") as file:
+    blob_data = blob_client.download_blob()
+    blob_data.readinto(file)
+
+
+
+# Load your CNN model here
+model = CNN.CNN(39)
+model.load_state_dict(torch.load(local_file_path))
+model.eval()
+
+def prediction(image_path):
+    image = Image.open(image_path)
+    image = image.resize((224, 224))
+    input_data = TF.to_tensor(image)
+    input_data = input_data.view((-1, 3, 224, 224))
+    output = model(input_data)
+    output = output.detach().numpy()
+    index = np.argmax(output)
+    return index
+
+def convert_to_jsonable(value):
+    if isinstance(value, np.int64):
+        return int(value)
+    elif isinstance(value, np.ndarray):
+        return value.tolist()
+    elif hasattr(value, '__dict__'):
+        return vars(value)
+    else:
+        return str(value)
+
+@app.post("/submit")
+async def submit(image: UploadFile = File(...)):
+    contents = await image.read()
+    filename = image.filename
+    file_path = os.path.join('static/uploads', filename)
+    with open(file_path, "wb") as f:
+        f.write(contents)
+    
+    pred = prediction(file_path)
+    title = disease_info['disease_name'][pred]
+    description = disease_info['description'][pred]
+    
+    # Check if 'possible_steps' column exists before accessing it
+    if 'possible_steps' in disease_info:
+        prevent = disease_info['possible_steps'][pred]
+    else:
+        prevent = "Preventive steps information not available"
+    
+    image_url = disease_info['image_url'][pred]
+    
+    # Correct column names for supplement_info DataFrame
+    supplement_name = supplement_info['supplement name'][pred]
+    supplement_image_url = supplement_info['supplement image'][pred]
+    supplement_buy_link = supplement_info['buy link'][pred]
+    
+    # Prepare response data
+    response_data = {
+        "title": title,
+        "description": description,
+        "prevent": prevent,
+        "image_url": image_url,
+        "supplement_name": supplement_name,
+        "supplement_image_url": supplement_image_url,
+        "supplement_buy_link": supplement_buy_link
+    }
+
+    jsonable_response = {key: convert_to_jsonable(value) for key, value in response_data.items()}
+    
+    return jsonable_response
+
+@app.get("/")
+async def read_root():
+    return FileResponse("index.html")
+
+#if __name__ == "__main__":
+#    uvicorn.run("main:app", host="0.0.0.0", port=int(os.environ.get("PORT", 8000)))
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="127.0.0.1", port=8001)
